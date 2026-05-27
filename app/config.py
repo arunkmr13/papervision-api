@@ -1,4 +1,5 @@
 import os
+from typing import List
 from pydantic_settings import BaseSettings
 from pydantic import Field
 
@@ -9,8 +10,11 @@ class Settings(BaseSettings):
     """
     GEMINI_API_KEY: str = Field(default="", description="Google Gemini API Key")
     GEMINI_MODEL: str = Field(default="gemini-2.5-flash", description="Primary Gemini model for extraction")
-    GEMINI_FALLBACK_MODEL: str = Field(default="gemini-1.5-flash", description="Fallback Gemini model if primary model fails")
-    
+    GEMINI_FALLBACK_MODELS: List[str] = Field(
+        default=["gemini-2.0-flash", "gemini-2.0-flash-lite"],
+        description="Ordered list of fallback Gemini models tried in sequence if the primary model fails"
+    )
+
     # Heuristic Thresholds
     MIN_WIDTH: int = Field(default=50, description="Minimum width of extracted raster image in pixels")
     MIN_HEIGHT: int = Field(default=50, description="Minimum height of extracted raster image in pixels")
@@ -19,7 +23,7 @@ class Settings(BaseSettings):
     BOTTOM_MARGIN_EXCLUSION_PCT: float = Field(default=10.0, description="Exclude bottom % of page height (footer area)")
     MAX_ASPECT_RATIO: float = Field(default=8.0, description="Exclude extremely narrow/wide images (aspect ratio threshold)")
     MAX_HASH_OCCURRENCES: int = Field(default=2, description="Exclude repeated image hashes appearing on more than N pages")
-    
+
     # Storage Settings
     UPLOAD_DIR: str = Field(default="storage/uploads", description="Directory to store uploaded PDF files during processing")
 

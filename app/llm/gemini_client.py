@@ -1,3 +1,4 @@
+import re
 import logging
 import asyncio
 from typing import Tuple, Dict, Any
@@ -52,6 +53,24 @@ Your task is to:
 Return a list of all identified figures in the 'figures' array field matching the VectorPageExtraction schema. Ignore general text.
 """
 
+
+def _parse_retry_delay(error: APIError) -> float | None:
+    """
+    Attempts to extract the server-recommended retry delay (in seconds) from a
+    429 APIError response. Gemini includes this in the error message as
+    'retryDelay: Xs'. Returns None if it cannot be parsed.
+    """
+    try:
+        error_str = str(error)
+        # Matches patterns like "retryDelay: '33s'" or 'retryDelay: "28.5s"' or "retryDelay: 10s"
+        match = re.search(r"retryDelay['\"\s:]+([0-9.]+)s", error_str)
+        if match:
+            return float(match.group(1))
+    except Exception:
+        pass
+    return None
+
+
 class GeminiClient:
     """
     Dedicated client class for interfacing with Google's Gemini Vision API.
@@ -77,21 +96,28 @@ class GeminiClient:
     ) -> Tuple[Any, Dict[str, int]]:
         """
         Synchronous helper that executes the generate_content call against the Gemini API.
-        Includes automatic retry logic and falls back to a secondary model (e.g. gemini-1.5-flash)
-        if the primary model experiences severe rate limits or server unavailability.
+
+        Retry behaviour:
+        - 429 RESOURCE_EXHAUSTED: reads the server-recommended retryDelay from the
+          error response and waits that long before retrying. If no delay is found,
+          falls back to exponential backoff. After max_retries, moves to the next model.
+        - 503 UNAVAILABLE: retries with exponential backoff.
+        - 404 NOT_FOUND: unretryable — skips immediately to the next model without
+          wasting retry attempts.
+        - Any other error: skips immediately to the next model.
         """
         import time
-        
-        models_to_try = [settings.GEMINI_MODEL]
-        # Only add the fallback model if it is different from the primary model
-        if settings.GEMINI_FALLBACK_MODEL and settings.GEMINI_FALLBACK_MODEL != settings.GEMINI_MODEL:
-            models_to_try.append(settings.GEMINI_FALLBACK_MODEL)
-            
+
+        models_to_try = [settings.GEMINI_MODEL] + [
+            m for m in settings.GEMINI_FALLBACK_MODELS
+            if m != settings.GEMINI_MODEL
+        ]
+
         max_retries = 3
-        base_delay = 2.0  # seconds
-        
+        base_delay = 2.0  # seconds — used only when server provides no retryDelay
+
         last_error = None
-        
+
         for model_name in models_to_try:
             for attempt in range(1, max_retries + 1):
                 try:
@@ -99,72 +125,143 @@ class GeminiClient:
                         f"Calling Gemini API using model '{model_name}' "
                         f"(Attempt {attempt}/{max_retries})..."
                     )
-                    
-                    # Send the PIL Image and the text prompt to the model
+
                     response = self.client.models.generate_content(
                         model=model_name,
                         contents=[image, prompt],
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
                             response_schema=response_schema,
-                            temperature=0.1,  # Low temperature for highly deterministic/factual extraction
+                            temperature=0.1,
                         ),
                     )
-                    
+
                     # Extract token usage from response metadata
                     prompt_tokens = 0
                     candidate_tokens = 0
                     total_tokens = 0
-                    
+
                     if response.usage_metadata:
-                        prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or getattr(response.usage_metadata, "promptTokenCount", 0) or 0
-                        candidate_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or getattr(response.usage_metadata, "candidatesTokenCount", 0) or 0
-                        total_tokens = getattr(response.usage_metadata, "total_token_count", 0) or getattr(response.usage_metadata, "totalTokenCount", 0) or 0
-                        
+                        prompt_tokens = (
+                            getattr(response.usage_metadata, "prompt_token_count", 0)
+                            or getattr(response.usage_metadata, "promptTokenCount", 0)
+                            or 0
+                        )
+                        candidate_tokens = (
+                            getattr(response.usage_metadata, "candidates_token_count", 0)
+                            or getattr(response.usage_metadata, "candidatesTokenCount", 0)
+                            or 0
+                        )
+                        total_tokens = (
+                            getattr(response.usage_metadata, "total_token_count", 0)
+                            or getattr(response.usage_metadata, "totalTokenCount", 0)
+                            or 0
+                        )
+
                     token_usage = {
                         "prompt": prompt_tokens,
                         "completion": candidate_tokens,
-                        "total": total_tokens
+                        "total": total_tokens,
                     }
-                    
-                    logger.info(f"Gemini API Call Succeeded with model '{model_name}'. Token Usage: {token_usage}")
-                    
-                    # Parse the text response which is guaranteed to match the schema
+
+                    logger.info(
+                        f"Gemini API call succeeded with model '{model_name}'. "
+                        f"Token usage: {token_usage}"
+                    )
+
                     parsed_response = response_schema.model_validate_json(response.text)
                     return parsed_response, token_usage
 
                 except APIError as ae:
                     last_error = ae
-                    status_code = getattr(ae, "code", 0) or getattr(ae, "status_code", 0) or 0
+                    status_code = (
+                        getattr(ae, "code", 0)
+                        or getattr(ae, "status_code", 0)
+                        or 0
+                    )
                     error_msg = str(ae).lower()
-                    
-                    # Check for rate limit or transient network unavailability
-                    is_rate_limit = (status_code == 429) or ("429" in error_msg) or ("resource_exhausted" in error_msg)
-                    is_server_error = (status_code == 503) or ("503" in error_msg) or ("unavailable" in error_msg)
-                    
-                    if (is_rate_limit or is_server_error) and attempt < max_retries:
+
+                    is_rate_limit = (
+                        status_code == 429
+                        or "429" in error_msg
+                        or "resource_exhausted" in error_msg
+                    )
+                    is_server_error = (
+                        status_code == 503
+                        or "503" in error_msg
+                        or "unavailable" in error_msg
+                    )
+                    is_not_found = (
+                        status_code == 404
+                        or "404" in error_msg
+                        or "not_found" in error_msg
+                    )
+
+                    # 404 means the model string is wrong — no point retrying
+                    if is_not_found:
+                        logger.warning(
+                            f"Gemini model '{model_name}' not found (404). "
+                            f"Check your model name in .env. Skipping to next model."
+                        )
+                        break
+
+                    if is_rate_limit and attempt < max_retries:
+                        # Respect the server-recommended delay if present
+                        server_delay = _parse_retry_delay(ae)
+                        if server_delay is not None:
+                            delay = server_delay
+                            logger.warning(
+                                f"Gemini model '{model_name}' rate limited (attempt {attempt}). "
+                                f"Server requests waiting {delay:.1f}s. Retrying..."
+                            )
+                        else:
+                            delay = base_delay * (2 ** (attempt - 1))
+                            logger.warning(
+                                f"Gemini model '{model_name}' rate limited (attempt {attempt}). "
+                                f"No server delay found, waiting {delay:.1f}s. Retrying..."
+                            )
+                        time.sleep(delay)
+                        continue
+
+                    if is_server_error and attempt < max_retries:
                         delay = base_delay * (2 ** (attempt - 1))
                         logger.warning(
-                            f"Gemini API model '{model_name}' transient issue (attempt {attempt}). "
-                            f"Retrying in {delay:.1f} seconds... Error: {ae}"
+                            f"Gemini model '{model_name}' server error (attempt {attempt}). "
+                            f"Retrying in {delay:.1f}s..."
                         )
                         time.sleep(delay)
                         continue
+
+                    # Rate limit exhausted all retries, or unretryable error
+                    if is_rate_limit:
+                        logger.warning(
+                            f"Gemini model '{model_name}' rate limit persisted after "
+                            f"{max_retries} attempts. Moving to next model."
+                        )
                     else:
                         logger.warning(
-                            f"Gemini API model '{model_name}' failed completely (attempts exhausted or unretryable): {ae}"
+                            f"Gemini model '{model_name}' unretryable error: {ae}. "
+                            f"Moving to next model."
                         )
-                        break  # Break out of the attempt loop to try the fallback model!
+                    break  # Try next model
+
                 except Exception as e:
                     last_error = e
-                    logger.error(f"Failed during Gemini processing or JSON validation: {e}")
-                    break  # Try the fallback model
-                    
-        # If we reached here, both models failed!
-        logger.error(f"All configured models ({models_to_try}) failed. Last error: {last_error}")
-        raise RuntimeError(f"Gemini processing failure after trying fallback models: {str(last_error)}") from last_error
+                    logger.error(
+                        f"Unexpected error during Gemini call or JSON validation: {e}"
+                    )
+                    break  # Try next model
 
-    async def extract_raster_figure(self, image: Image.Image) -> Tuple[FigureExtraction, Dict[str, int]]:
+        logger.error(
+            f"All configured models ({models_to_try}) failed. Last error: {last_error}"
+        )
+        raise RuntimeError(
+            f"Gemini processing failure after trying all models: {str(last_error)}"
+        ) from last_error
+
+    async def extract_raster_figure(
+        self, image: Image.Image
+    ) -> Tuple[FigureExtraction, Dict[str, int]]:
         """
         Extracts structured text from a cropped, isolated raster figure image.
         Uses asyncio.to_thread to prevent blocking the async event loop during HTTP requests.
@@ -173,20 +270,24 @@ class GeminiClient:
             self._call_gemini_sync,
             image=image,
             prompt=RASTER_FIGURE_PROMPT,
-            response_schema=FigureExtraction
+            response_schema=FigureExtraction,
         )
 
-    async def extract_vector_page_figures(self, page_image: Image.Image) -> Tuple[VectorPageExtraction, Dict[str, int]]:
+    async def extract_vector_page_figures(
+        self, page_image: Image.Image
+    ) -> Tuple[VectorPageExtraction, Dict[str, int]]:
         """
-        Identifies and extracts figures on a full-page rendered image (for pages with vector shapes but no rasters).
+        Identifies and extracts figures on a full-page rendered image (for pages
+        with vector shapes but no rasters).
         Uses asyncio.to_thread to prevent blocking the async event loop during HTTP requests.
         """
         return await asyncio.to_thread(
             self._call_gemini_sync,
             image=page_image,
             prompt=VECTOR_PAGE_PROMPT,
-            response_schema=VectorPageExtraction
+            response_schema=VectorPageExtraction,
         )
+
 
 # Instantiate a single global Gemini client wrapper
 gemini_client = GeminiClient()
